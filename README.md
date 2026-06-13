@@ -1,76 +1,268 @@
-# Cloud Tele Service — Appointment Booking API
+# CloudTeleService — Telehealth Appointment Scheduling Platform
 
-**Laravel 9 REST API** for a telecommunications/appointment booking service. Handles calendar-based booking with Stripe payments, Google Calendar synchronization (full + incremental sync), and a Blade admin panel. Background job processing via Laravel Horizon queues.
+> **Laravel 9** REST API for managing telehealth appointments via **Google Calendar** as the source of truth. Implements full/incremental sync, async Google Meet link generation, Stripe payment on booking, and a single-action architecture via `lorisleiva/laravel-actions`. Backed by Redis/Horizon for async queue processing.
 
-![PHP](https://img.shields.io/badge/PHP-8.0%2B-777BB4?style=flat&logo=php)
-![Laravel](https://img.shields.io/badge/Laravel-9.x-FF2D20?style=flat&logo=laravel)
-![Stripe](https://img.shields.io/badge/Stripe-Payments-008CDD?style=flat&logo=stripe)
-![Google Calendar](https://img.shields.io/badge/Google_Calendar_API-4285F4?style=flat&logo=googlecalendar)
-![Laravel Horizon](https://img.shields.io/badge/Laravel_Horizon-Queue-FF2D20?style=flat&logo=laravel)
-![Redis](https://img.shields.io/badge/Redis-Queue-DC382D?style=flat&logo=redis)
-![MySQL](https://img.shields.io/badge/MySQL-4479A1?style=flat&logo=mysql)
+![Laravel](https://img.shields.io/badge/Laravel-9-FF2D20?style=flat-square&logo=laravel&logoColor=white)
+![PHP](https://img.shields.io/badge/PHP-8.0-777BB4?style=flat-square&logo=php&logoColor=white)
+![Google Calendar](https://img.shields.io/badge/Google_Calendar_API-4285F4?style=flat-square&logo=google-calendar&logoColor=white)
+![Stripe](https://img.shields.io/badge/Stripe-10.x-635BFF?style=flat-square&logo=stripe&logoColor=white)
+![Horizon](https://img.shields.io/badge/Laravel_Horizon-Redis-FF2D20?style=flat-square)
 
-## Features
+---
 
-**Appointment Booking** — Client submits name, email, services, and Stripe token. Backend charges the booking fee, creates the appointment, and dispatches a job to add it to Google Calendar with a Google Meet link.
+## Table of Contents
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Route Structure](#route-structure)
+- [Database Schema](#database-schema)
+- [Google Calendar Integration](#google-calendar-integration)
+- [Booking & Payment Flow](#booking--payment-flow)
+- [Async Queue Jobs](#async-queue-jobs)
+- [Availability Slot Logic](#availability-slot-logic)
+- [Single-Action Pattern](#single-action-pattern)
+- [Getting Started](#getting-started)
 
-**Google Calendar Sync** — Full sync, incremental sync via sync tokens, free/busy checking, event CRUD (`GoogleCalendarService`). Processed async via `events_sync` queue.
-
-**Working Time Slots** — Configurable 1-hour slots (09:00–16:00); exposed via `GET /api/event/slots`.
-
-**Flight Booking** — Book a flight request (origin/destination/class) with Stripe charge at configurable `FLIGHT_FEE`.
-
-**Contact Form** — `POST /api/contact` stores inquiries.
-
-**Admin Panel** (Blade) — Dashboard with FullCalendar view, event CRUD + status management (confirmed/pending/cancelled), document upload, flights list, contacts list.
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/google/calendar/{calendar}/events` | Create appointment (charge + Google Calendar) |
-| `POST` | `/api/event/slots` | Get available time slots |
-| `POST` | `/api/flight` | Book a flight (Stripe charge) |
-| `POST` | `/api/contact` | Submit contact form |
-| `GET/PUT/DELETE` | `/api/google/calendar/{calendar}/events/{event}` | Event CRUD |
-
-## Database Schema
-
-Tables: `users`, `calendars`, `events`, `event_attendees`, `flights`, `payments`, `contacts`, `documents`
-
-- `events` — UUID PK, calendar ref, title, attendees, status, Stripe payment info
-- `flights` — UUID PK, origin, destination, class, Stripe charge, status
-- `payments` — Stripe charge records linked to events/flights
+---
 
 ## Architecture
 
 ```
-API routes:
-  POST /api/google/calendar/{calendar}/events
-    → GoogleCalendarController
-      → Stripe::charge()
-      → Event::create()
-      → dispatch(AddToGoogleCalendarJob)  →  Google Calendar API
-
-Admin routes:
-  /dashboard  /events  /flights  /contact-us
-
-Queue: events_sync (Redis + Horizon)
-  → GoogleCalendarService (full/incremental sync, free/busy)
+Client (SPA / mobile)
+    |
+    v
+REST API (this repo — Laravel 9)
+    |
+    +--- Stripe Charge (synchronous, before any DB write)
+    |
+    +--- Write to local DB (events, attendees, payments)
+    |
+    +--- Dispatch async queue jobs (Laravel Horizon + Redis)
+              |
+              v
+         Google Calendar API
+         - Create event with Google Meet link
+         - Send attendee email notifications
+         - Store sync_token for incremental sync
 ```
 
-> Uses `lorisleiva/laravel-actions` — all business logic in single-responsibility Action classes. Google service account key at `storage/app/google/calendar-credentials.json`.
+**Google Calendar is the authoritative calendar store.** The local `events` table mirrors calendar data, linked by `ref_id` (Google Calendar event ID). Incremental sync keeps local DB current with external calendar changes.
+
+---
+
+## Tech Stack
+
+| Package | Version | Purpose |
+|---|---|---|
+| `laravel/framework` | ^9.19 | Core framework |
+| `google/apiclient` | ^2.0 | Google Calendar API (OAuth2 service account) |
+| `stripe/stripe-php` | ^10.12 | Payment processing |
+| `lorisleiva/laravel-actions` | ^2.5 | Single-action architecture (controller + job + command in one class) |
+| `laravel/horizon` | ^5.14 | Queue monitoring and management |
+| `predis/predis` | ^2.1 | Redis driver (queue backend) |
+| `laravel/passport` | ^11.8 | OAuth2 |
+| `laravel/sanctum` | ^3.0 | API token auth |
+| `yajra/laravel-datatables-oracle` | ~9.0 | Admin panel server-side tables |
+| `guzzlehttp/guzzle` | ^7.2 | HTTP client |
+| `doctrine/dbal` | ^3.6 | Database abstraction |
+
+**Queue:** Redis via Predis. **Queue name:** `events_sync`. **Monitor:** Laravel Horizon.
+
+---
+
+## Route Structure
+
+**REST API (`/api/*`):**
+
+| Method | Endpoint | Action Class | Description |
+|---|---|---|---|
+| `GET` | `/google/calendar/{calendar}/events` | `GetAllEventsAction` | List all calendar events |
+| `POST` | `/google/calendar/{calendar}/events` | `CreateEventAction` | Book appointment (Stripe charge + queue dispatch) |
+| `GET` | `/google/calendar/{calendar}/events/{event}` | `GetEventAction` | Get single event detail |
+| `PUT` | `/google/calendar/{calendar}/events/{event}` | `UpdateEventAction` | Reschedule appointment |
+| `DELETE` | `/google/calendar/{calendar}/events/{event}` | `DeleteEventAction` | Cancel appointment |
+| `POST` | `/api/event/slots` | `GetAllEventsSlotAction` | Available time slots for a given date |
+| `POST` | `/api/contact` | `ContactAction` | Contact form submission |
+| `POST` | `/api/flight` | `CreateFlightAction` | Flight booking request (Stripe charge) |
+| `GET` | `/api/google/calendar/sync` | Closure | Trigger incremental sync manually |
+| `GET` | `/api/get/stripe/token` | `GetStripeTokenAction` | Test token generation |
+
+**Admin Web Panel (Blade, session auth):**
+`/admin/dashboard` — FullCalendar.js event view, `/admin/events` (list + detail + status update + document upload), `/admin/flights` (flight request list), `/admin/contacts`.
+
+---
+
+## Database Schema
+
+All domain models use UUID primary keys (`HasUuids` trait).
+
+| Table | Key Columns |
+|---|---|
+| `calendars` | uuid PK, `ref_id` (Google Calendar ID), timezone, `sync_token` (incremental sync cursor) |
+| `events` | uuid PK, `ref_id` (Google Calendar event ID), calendar_id FK, description, summary, services, `hangoutLink`, start, end, timezone, `status` (enum: confirmed/tentative/cancelled/pending) |
+| `event_attendees` | uuid PK, fname, lname, phone, email |
+| `event_event_attendee` | pivot — event_id, event_attendee_id |
+| `flights` | uuid PK, name, email, phone, location, destination, class, terms |
+| `documents` | uuid PK, event_id FK, created_by, type, description, doc_link |
+| `payments` | uuid PK, event_id FK (nullable), flight_id FK (nullable), amount, stripeToken |
+| `contacts` | id, name, email, phone, subject, message, terms |
+| `users` | Standard Laravel users table |
+
+---
+
+## Google Calendar Integration
+
+**Service class:** `GoogleCalendarService` — wraps `google/apiclient`.
+
+**Authentication:** OAuth2 service account with domain-wide delegation. Credentials stored at `storage/app/google/calendar-credentials.json`. The service impersonates the calendar owner's Google account.
+
+**Sync Strategy:**
+```
+First run:  initalFullSync()
+   -> Lists ALL events from Google Calendar
+   -> Stores sync_token in calendars.sync_token
+
+Subsequent runs: incrementalSync(syncToken)
+   -> Fetches only changes since last sync
+   -> Updates local events DB (created/updated/cancelled)
+   -> Stores new sync_token
+
+Triggered by: GET /api/google/calendar/sync
+```
+
+**Create Event Flow:**
+```
+POST /google/calendar/{calendar}/events
+    |
+    v
+Google Calendar API: events.insert()
+  - conferenceData: { createRequest: { hangoutsMeet } }  <- auto-generates Google Meet link
+  - sendUpdates: 'all'  <- attendee email notifications sent by Google
+  - Reschedule link embedded in event description: {APP_SPA_URL}/appointment/{eventUuid}
+    |
+    v
+Response includes: hangoutLink (Google Meet URL), Google event ID (stored as ref_id)
+```
+
+**Methods:**
+`initalFullSync()`, `incrementalSync(syncToken)`, `freeBusy()`, `createEvent()`, `updateEvent()`, `deleteEvent()`, `getEvent()`.
+
+---
+
+## Booking & Payment Flow
+
+```
+1. Client calls POST /google/calendar/{calendar}/events
+
+2. Stripe Charge (synchronous — must succeed before any DB write):
+   Stripe::create('Charge', [
+     'amount' => config('calendar.booking_fee') * 100,
+     'currency' => 'usd',
+     'source' => $request->stripeToken,
+   ])
+
+3. DB writes in a single transaction:
+   a. Create Event record (local mirror)
+   b. Create EventAttendee record
+   c. Attach attendee to event (pivot)
+   d. Create Payment record
+
+4. Dispatch async job: AddEventsToGoogleCalendarJob (on events_sync queue)
+   -> GoogleCalendarService::createEvent() -> Google Calendar API
+   -> Updates local event.ref_id with Google event ID
+   -> Updates local event.hangoutLink with Google Meet URL
+
+5. Return event UUID to client
+   (client polls /api/appointment/{uuid} until hangoutLink is populated)
+```
+
+**Flight booking** (`POST /api/flight`) follows the same pattern: Stripe charge → `flights` DB record → `payments` record.
+
+---
+
+## Async Queue Jobs
+
+All dispatched to the `events_sync` queue, monitored by Laravel Horizon:
+
+| Job | Trigger | Action |
+|---|---|---|
+| `AddEventsToGoogleCalendarJob` | New booking confirmed | Creates event in Google Calendar, stores `ref_id` + `hangoutLink` |
+| `UpdateEventFromGoogleCalendarJob` | Rescheduled appointment | Updates Google Calendar event time, sends attendee update email |
+| `DeleteEventFromGoogleCalendarJob` | Cancelled appointment | Deletes event from Google Calendar, notifies attendees |
+| `SyncEventsJob` | Manual sync trigger or scheduled | Runs `incrementalSync()`, updates local DB from Google changes |
+
+---
+
+## Availability Slot Logic
+
+`GetAllEventsSlotAction` — calculates free booking slots for a given date:
+
+```
+1. Read config('calendar.working_slots')  <- fixed hours e.g. 09:00-16:00
+2. For each slot time:
+   a. Check if events table has a row with matching start time (slot taken)
+   b. If today's date, filter out slots in the past (timezone-aware)
+3. Return only available (unclaimed) slot times
+```
+
+**Config** (`config/calendar.php`): `calendar_id`, `booking_fee`, `flight_fee`, `working_slots[]`, `event_interval` (60 min), `admin_email`, `notify_to`, `statuses[]`.
+
+---
+
+## Single-Action Pattern
+
+Uses `lorisleiva/laravel-actions ^2.5` — each action class can be invoked as:
+- A **controller** (via `asController()`)
+- A **job** (via `asJob()`)
+- An **artisan command** (via `asCommand()`)
+- A **listener** (via `asListener()`)
+
+```php
+class CreateEventAction
+{
+    use AsAction;
+
+    public function rules(): array { /* validation */ }
+
+    public function handle(Calendar $calendar, array $data): Event
+    {
+        // Core business logic
+    }
+
+    public function asController(Calendar $calendar, Request $request): JsonResponse
+    {
+        // HTTP-specific: Stripe charge, DB transaction, queue dispatch
+    }
+}
+```
+
+This eliminates traditional controllers — each action is a self-contained, testable unit of business logic.
+
+---
 
 ## Getting Started
 
 ```bash
 composer install
-cp .env.example .env && php artisan key:generate
-# Set DB_*, GOOGLE_CALENDAR_ID, STRIPE_SECRET, BOOKING_FEE, FLIGHT_FEE, APP_SPA_URL
-php artisan migrate --seed
-# Place Google service account JSON at storage/app/google/calendar-credentials.json
-php artisan horizon && php artisan serve
+cp .env.example .env
+php artisan key:generate
+php artisan migrate
+
+# Place Google service account credentials:
+# storage/app/google/calendar-credentials.json
+
+php artisan horizon          # Queue worker
+php artisan serve
 ```
 
-## License
-MIT
+**Required environment variables:**
+```env
+GOOGLE_CALENDAR_CREDENTIAL_PATH=storage/app/google/calendar-credentials.json
+GOOGLE_CALENDAR_SUBJECT=admin@yourdomain.com  # Impersonated account
+APP_SPA_URL=https://your-frontend.com
+
+STRIPE_KEY=
+STRIPE_SECRET=
+
+REDIS_HOST=
+QUEUE_CONNECTION=redis
+```
